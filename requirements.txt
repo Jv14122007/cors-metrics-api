@@ -1,4 +1,5 @@
-
 fastapi
 uvicorn
-redis
+PyJWT[crypto]
+PyYAML
+python-dotenv
