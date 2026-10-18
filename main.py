@@ -1,238 +1,90 @@
 
-import os
+import json
 import time
 import uuid
-from collections import defaultdict
-from pathlib import Path
+from collections import deque
+from datetime import datetime, timezone
+from threading import Lock
 
-import jwt
-import yaml
-from dotenv import dotenv_values
-from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from starlette.types import ASGIApp, Scope, Receive, Send
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import PlainTextResponse
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
-
-# ----------------------------
-# Configuration
-# ----------------------------
 EMAIL = "25f2006465@ds.study.iitm.ac.in"
+START_TIME = time.monotonic()
 
-ISSUER = "https://idp.exam.local"
-AUDIENCE = "tds-os3x4y2c.apps.exam.local"
+app = FastAPI()
 
-PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2okOHspNjgA+2rTLbeuY
-cxiP/hG8C6Sb9iwg3yiLAA4HCnpITcbWCSelbvbYGuc3EbNy4xFyf5Cbj5DHJMID
-EkryOgyd2giIIIBOUBj8S63uGcnRpOBh9NFatfNwheKuzsPuVNldu6A9cNteNpXc
-WyJjG2axVfmq7i6SuKr1JoWYG7xTTAvKPujSl4OtsQfO3h5NepzdfXpr28oNnzfW
-ed+zclR6BcmNNo/WVfJ4xyCLSf0BCOgdTgW6PdaChd1l9VDetJZVEgC5tkyvXsfI
-SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
-dQIDAQAB
------END PUBLIC KEY-----"""
-
-ANALYTICS_API_KEY = "ak_9lakrklc9jdh5e5pj2m28409"
-
-api = FastAPI()
-
-# Allow browser requests from the exam page.
-api.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Live Prometheus counter, incremented for every HTTP request.
+REQUESTS = Counter(
+    "http_requests_total",
+    "Total number of HTTP requests",
 )
 
-
-# ----------------------------
-# Q3: Stats endpoint
-# ----------------------------
-@api.get("/stats")
-def stats(values: str):
-    try:
-        numbers = [float(x.strip()) for x in values.split(",") if x.strip()]
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid values")
-
-    if not numbers:
-        raise HTTPException(status_code=400, detail="No values provided")
-
-    return {
-        "email": EMAIL,
-        "count": len(numbers),
-        "sum": sum(numbers),
-        "min": min(numbers),
-        "max": max(numbers),
-        "mean": sum(numbers) / len(numbers),
-    }
+LOG_LIMIT = 2000
+logs = deque(maxlen=LOG_LIMIT)
+log_lock = Lock()
 
 
-# ----------------------------
-# Q4: OAuth2/OIDC token verification
-# ----------------------------
-@api.post("/verify")
-def verify_token(body: dict):
-    token = body.get("token", "")
+@app.middleware("http")
+async def observe_requests(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    REQUESTS.inc()
 
     try:
-        claims = jwt.decode(
-            token,
-            PUBLIC_KEY,
-            algorithms=["RS256"],
-            issuer=ISSUER,
-            audience=AUDIENCE,
-            options={"require": ["exp", "iss", "aud", "sub", "email"]},
-        )
-        return {
-            "valid": True,
-            "email": claims["email"],
-            "sub": claims["sub"],
-            "aud": claims["aud"],
-        }
+        response = await call_next(request)
+        level = "INFO"
     except Exception:
-        return JSONResponse(status_code=401, content={"valid": False})
+        level = "ERROR"
+        response = None
+        raise
+    finally:
+        entry = {
+            "level": level,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "path": request.url.path,
+            "request_id": request_id,
+            "method": request.method,
+            "duration_s": round(time.perf_counter() - start, 6),
+        }
+
+        with log_lock:
+            logs.append(entry)
+
+        print(json.dumps(entry), flush=True)
+
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
-# ----------------------------
-# Q5: Effective configuration
-# ----------------------------
-DEFAULT_CONFIG = {
-    "port": 8000,
-    "workers": 1,
-    "debug": False,
-    "log_level": "info",
-    "api_key": "default-secret-000",
-}
+@app.get("/work")
+def work(n: int = Query(default=1, ge=0, le=1000000)):
+    # Perform n units of simple work.
+    result = 0
+    for i in range(n):
+        result += i
 
-CONFIG_FILE = Path("config.development.yaml")
-if CONFIG_FILE.exists():
-    with CONFIG_FILE.open("r", encoding="utf-8") as f:
-        YAML_CONFIG = yaml.safe_load(f) or {}
-else:
-    YAML_CONFIG = {}
-
-DOTENV_CONFIG = dotenv_values(".env")
+    return {"email": EMAIL, "done": n}
 
 
-def to_bool(value):
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in ("true", "1", "yes", "on")
+@app.get("/metrics")
+def metrics():
+    return PlainTextResponse(
+        generate_latest().decode("utf-8"),
+        media_type=CONTENT_TYPE_LATEST,
+    )
 
 
-def coerce_config(key, value):
-    if key in ("port", "workers"):
-        return int(value)
-    if key == "debug":
-        return to_bool(value)
-    return str(value)
-
-
-@api.get("/effective-config")
-def effective_config(set: list[str] = Query(default=[])):
-    config = DEFAULT_CONFIG.copy()
-
-    # Layer 2: YAML
-    config.update({k: v for k, v in YAML_CONFIG.items() if k in config})
-
-    # Layer 3: .env
-    env_aliases = {
-        "NUM_WORKERS": "workers",
-        "APP_DEBUG": "debug",
-        "APP_LOG_LEVEL": "log_level",
-        "APP_PORT": "port",
-        "APP_API_KEY": "api_key",
-    }
-    for env_name, config_key in env_aliases.items():
-        value = DOTENV_CONFIG.get(env_name)
-        if value is not None:
-            config[config_key] = value
-
-    # Layer 4: operating-system environment variables
-    for env_name, config_key in env_aliases.items():
-        value = os.getenv(env_name)
-        if value is not None:
-            config[config_key] = value
-
-    # Layer 5: repeated query params set=key=value
-    for item in set:
-        if "=" not in item:
-            continue
-        key, value = item.split("=", 1)
-        if key in config:
-            config[key] = value
-
-    result = {key: coerce_config(key, value) for key, value in config.items()}
-    result["api_key"] = "****"
-    return result
-
-
-# ----------------------------
-# Q7: Analytics endpoint
-# ----------------------------
-@api.post("/analytics")
-def analytics(
-    body: dict,
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-):
-    if x_api_key != ANALYTICS_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    events = body.get("events", [])
-    users = set()
-    user_totals = defaultdict(float)
-    revenue = 0.0
-
-    for event in events:
-        user = event["user"]
-        amount = float(event["amount"])
-        users.add(user)
-
-        if amount > 0:
-            revenue += amount
-            user_totals[user] += amount
-
-    top_user = max(user_totals, key=user_totals.get) if user_totals else ""
-
+@app.get("/healthz")
+def healthz():
     return {
-        "email": EMAIL,
-        "total_events": len(events),
-        "unique_users": len(users),
-        "revenue": revenue,
-        "top_user": top_user,
+        "status": "ok",
+        "uptime_s": float(max(0.0, time.monotonic() - START_TIME)),
     }
 
 
-# ----------------------------
-# Request ID and processing-time headers on every response
-# ----------------------------
-class RequestMetricsMiddleware:
-    def __init__(self, app: ASGIApp):
-        self.app = app
-
-    async def __call__(
-        self, scope: Scope, receive: Receive, send: Send
-    ):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        request_id = str(uuid.uuid4())
-        start = time.perf_counter()
-
-        async def send_with_metrics(message):
-            if message["type"] == "http.response.start":
-                elapsed = max(0.0, time.perf_counter() - start)
-                headers = list(message.get("headers", []))
-                headers.extend([
-                    (b"x-request-id", request_id.encode("ascii")),
-                    (b"x-process-time", str(elapsed).encode("ascii")),
-                ])
-                message["headers"] = headers
-            await send(message)
-
-        await self.app(scope, receive, send_with_metrics)
-
-
-app = RequestMetricsMiddleware(api)
+@app.get("/logs/tail")
+def logs_tail(limit: int = Query(default=100, ge=1, le=2000)):
+    with log_lock:
+        return list(logs)[-limit:]
